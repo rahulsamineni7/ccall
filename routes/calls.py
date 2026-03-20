@@ -6,12 +6,14 @@ hanging up calls, and processing Twilio status webhooks.
 """
 import os
 import json
+import uuid
+import asyncio
 import urllib.parse
 import logging
 
-from fastapi import APIRouter, Request, Depends, HTTPException, Response
+from fastapi import APIRouter, Request, Depends, HTTPException, Response, BackgroundTasks
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 
 from dependencies import get_current_user
 from twilio_provisioning import get_provisioner
@@ -21,12 +23,26 @@ logger = logging.getLogger("alora.calls")
 
 router = APIRouter(prefix="/api/calls", tags=["Calls"])
 
+# ── In-memory campaign status (lightweight, no extra DB table needed) ────────
+CAMPAIGN_STATUS = {}  # campaign_id -> {total, completed, failed, in_progress, results: []}
+
 # ── Pydantic Models ──────────────────────────────────────────────────────────
 
 class MakeCallRequest(BaseModel):
     to: str
     from_: str = Field(..., alias="from")
     context: Optional[dict] = {}
+    system_prompt: Optional[str] = None
+
+
+class Contact(BaseModel):
+    phone_number: str
+    context: Optional[dict] = {}
+
+
+class BulkCallRequest(BaseModel):
+    from_number: str = Field(..., alias="from")
+    contacts: List[Contact]
     system_prompt: Optional[str] = None
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -239,3 +255,174 @@ async def call_status_webhook(request: Request):
         logger.error(f"Error processing status webhook: {e}")
 
     return Response(content="<Response/>", media_type="application/xml")
+
+
+# ── Bulk Calling ─────────────────────────────────────────────────────────────
+
+async def _process_bulk_campaign(
+    campaign_id: str,
+    user: dict,
+    from_number: str,
+    contacts: list[Contact],
+    system_prompt: str | None,
+    base_url: str,
+):
+    """Background worker: dispatches calls one-by-one with rate limiting."""
+    provisioner = get_provisioner()
+    client = provisioner.client
+
+    CAMPAIGN_STATUS[campaign_id] = {
+        "total": len(contacts),
+        "completed": 0,
+        "failed": 0,
+        "in_progress": 0,
+        "results": [],
+    }
+    status = CAMPAIGN_STATUS[campaign_id]
+
+    for i, contact in enumerate(contacts):
+        clean_to = contact.phone_number.replace(" ", "").replace("-", "")
+        ctx = contact.context or {}
+        ctx["call_type"] = "outbound"
+        ctx["campaign_id"] = campaign_id
+        ctx["campaign_index"] = i
+
+        context_json = json.dumps(ctx)
+        context_encoded = urllib.parse.quote(context_json)
+        prompt_encoded = urllib.parse.quote(system_prompt or "")
+        phone_encoded = urllib.parse.quote(clean_to)
+
+        twiml_url = (
+            f"{base_url}/twilio/incoming?call_type=outbound"
+            f"&phone={phone_encoded}&context={context_encoded}&prompt={prompt_encoded}"
+        )
+
+        try:
+            call = client.calls.create(
+                to=clean_to,
+                from_=from_number,
+                url=twiml_url,
+                status_callback=f"{base_url}/api/calls/status",
+                status_callback_event=["initiated", "ringing", "answered", "completed"],
+                status_callback_method="POST",
+            )
+
+            # Persist to DB
+            try:
+                supabase.table("outbound_calls").insert({
+                    "user_id": user.id,
+                    "call_sid": call.sid,
+                    "to_number": clean_to,
+                    "from_number": from_number,
+                    "status": call.status,
+                    "system_instruction": system_prompt,
+                    "context_data": ctx,
+                    "active_rules": [],
+                }).execute()
+            except Exception as db_err:
+                logger.error(f"Bulk call DB insert error: {db_err}")
+
+            status["completed"] += 1
+            status["results"].append({
+                "phone": clean_to,
+                "call_sid": call.sid,
+                "status": call.status,
+            })
+            logger.info(f"Campaign {campaign_id} [{i+1}/{len(contacts)}] → {clean_to}: {call.status}")
+
+        except Exception as e:
+            status["failed"] += 1
+            status["results"].append({
+                "phone": clean_to,
+                "call_sid": None,
+                "status": "failed",
+                "error": str(e),
+            })
+            logger.error(f"Campaign {campaign_id} [{i+1}/{len(contacts)}] → {clean_to}: FAILED - {e}")
+
+        # ── Rate limit: 1 call per second (Twilio standard CPS) ──
+        if i < len(contacts) - 1:
+            await asyncio.sleep(1)
+
+    logger.info(f"Campaign {campaign_id} finished: {status['completed']} ok, {status['failed']} failed")
+
+
+@router.post("/bulk")
+async def bulk_outbound_call(
+    bulk_req: BulkCallRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+):
+    """Launch a bulk outbound calling campaign. Returns immediately with a campaign_id."""
+    if not bulk_req.contacts:
+        raise HTTPException(status_code=400, detail="Contact list is empty")
+    if len(bulk_req.contacts) > 500:
+        raise HTTPException(status_code=400, detail="Maximum 500 contacts per campaign")
+
+    campaign_id = str(uuid.uuid4())
+
+    # Resolve base URL
+    base_url = os.environ.get("BASE_URL", "").rstrip("/")
+    if not base_url:
+        host = request.headers.get("host", "localhost")
+        proto = "https" if "localhost" not in host else "http"
+        base_url = f"{proto}://{host}"
+
+    background_tasks.add_task(
+        _process_bulk_campaign,
+        campaign_id=campaign_id,
+        user=user,
+        from_number=bulk_req.from_number,
+        contacts=bulk_req.contacts,
+        system_prompt=bulk_req.system_prompt,
+        base_url=base_url,
+    )
+
+    logger.info(f"Bulk campaign {campaign_id} queued: {len(bulk_req.contacts)} contacts")
+
+    return {
+        "campaign_id": campaign_id,
+        "status": "queued",
+        "total_contacts": len(bulk_req.contacts),
+    }
+
+
+@router.get("/campaigns/{campaign_id}")
+async def get_campaign_status(campaign_id: str, user: dict = Depends(get_current_user)):
+    """Get the current status of a bulk calling campaign."""
+    if campaign_id in CAMPAIGN_STATUS:
+        return {"campaign_id": campaign_id, **CAMPAIGN_STATUS[campaign_id]}
+
+    # Fallback: query DB for calls tagged with this campaign_id
+    try:
+        res = (
+            supabase.table("outbound_calls")
+            .select("call_sid, to_number, status, context_data")
+            .eq("user_id", user.id)
+            .execute()
+        )
+        matches = [
+            r for r in (res.data or [])
+            if isinstance(r.get("context_data"), dict)
+            and r["context_data"].get("campaign_id") == campaign_id
+        ]
+        if matches:
+            completed = sum(1 for m in matches if m["status"] == "completed")
+            failed = sum(1 for m in matches if m["status"] == "failed")
+            return {
+                "campaign_id": campaign_id,
+                "total": len(matches),
+                "completed": completed,
+                "failed": failed,
+                "in_progress": len(matches) - completed - failed,
+                "results": [
+                    {"phone": m["to_number"], "call_sid": m["call_sid"], "status": m["status"]}
+                    for m in matches
+                ],
+            }
+    except Exception as e:
+        logger.error(f"Campaign lookup error: {e}")
+
+    raise HTTPException(status_code=404, detail="Campaign not found")
+

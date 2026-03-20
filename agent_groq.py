@@ -538,26 +538,23 @@ You: (Call Tool: book_test_drive(customer_name='Rahul', ...))
                         }
                         filler_text = fillers.get(lang_code, "Just a moment, checking...")
                         
-                        ws_filler = await self.cartesia.tts.websocket()
-                        
                         # Get Voice ID (Reusing logic or just using current)
                         # We need to send this to user
                         voice_id_filler, _, model_id_filler = self._get_voice_settings(filler_text)
                         
-                        await ws_filler.send(
-                            model_id=model_id_filler,
-                            transcript=filler_text,
-                            voice={"mode": "id", "id": voice_id_filler},
-                            output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": self.output_sample_rate},
-                            language=lang_code,
-                            stream=False # One shot
-                        )
-                        # Yield Audio to Twilio immediately
-                        async for audio_chunk in ws_filler:
-                            if hasattr(audio_chunk, "audio") and audio_chunk.audio:
-                                 yield None, audio_chunk.audio
-                        
-                        await ws_filler.close()
+                        async with self.cartesia.tts.websocket_connect() as ws_filler:
+                            ctx_filler = ws_filler.context()
+                            await ctx_filler.send(
+                                model_id=model_id_filler,
+                                transcript=filler_text,
+                                voice={"mode": "id", "id": voice_id_filler},
+                                output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": self.output_sample_rate},
+                                language=lang_code
+                            )
+                            # Yield Audio to Twilio immediately
+                            async for event in ctx_filler.receive():
+                                if event.type == "chunk" and hasattr(event, "audio") and event.audio:
+                                     yield None, event.audio
                     except Exception as e:
                         print(f"[FILLER] Error: {e}")
                 # ------------------------
@@ -600,71 +597,66 @@ You: (Call Tool: book_test_drive(customer_name='Rahul', ...))
         
         # Open TTS WebSocket with Fallback
         try:
-            ws = await self.cartesia.tts.websocket()
+            async with self.cartesia.tts.websocket_connect() as ws:
+                async for chunk in stream:
+                    token = chunk.choices[0].delta.content or ""
+                    buffer += token
+                    current_sentence += token
+                    full_response += token
+                    
+                    # Heuristic: Check for sentence delimiters
+                    if any(punct in token for punct in [".", "?", "!", "\n", "sir", "mam", ":"]):
+                        # If sentence is long enough, send it
+                        if len(current_sentence.strip()) > 5: # Avoid "Hi." latency
+                                print(f"[STREAM] Sent to TTS: {current_sentence}")
+                                
+                                # Measure TTS Latency
+                                t_tts_start = time.time()
+                                first_byte = True
+
+                                # Stream TTS audio chunks directly
+                                voice_id, lang_code, model_id = self._get_voice_settings(current_sentence)
+                                ctx = ws.context()
+                                await ctx.send(
+                                    model_id=model_id,
+                                    transcript=current_sentence,
+                                    voice={"mode": "id", "id": voice_id},
+                                    output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": self.output_sample_rate},
+                                    language=lang_code
+                                )
+                                async for event in ctx.receive():
+                                    if event.type == "chunk" and hasattr(event, "audio") and event.audio:
+                                        if first_byte:
+                                            print(f"[TIME] TTS Latency: {time.time() - t_tts_start:.3f}s")
+                                            first_byte = False
+                                        yield None, event.audio
+                                
+                                yield {"agent": current_sentence}, None # Update UI incrementally
+                                current_sentence = ""
+
+                # Flush remaining buffer
+                if current_sentence.strip():
+                    print(f"[STREAM] Sent Final: {current_sentence}")
+                    voice_id, lang_code, model_id = self._get_voice_settings(current_sentence)
+                    ctx = ws.context()
+                    await ctx.send(
+                        model_id=model_id,
+                        transcript=current_sentence,
+                        voice={"mode": "id", "id": voice_id},
+                        output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": 24000},
+                        language=lang_code
+                    )
+                    async for event in ctx.receive():
+                        if event.type == "chunk" and hasattr(event, "audio") and event.audio:
+                            yield None, event.audio
+                    yield {"agent": current_sentence}, None
+
         except Exception as e:
             print(f"[CARTESIA] Connection Failed: {e}.")
             yield {"error": "TTS Connection Failed"}, None
             return
-        
-        try:
-            async for chunk in stream:
-                token = chunk.choices[0].delta.content or ""
-                buffer += token
-                current_sentence += token
-                full_response += token
-                
-                # Heuristic: Check for sentence delimiters
-                if any(punct in token for punct in [".", "?", "!", "\n", "sir", "mam", ":"]):
-                    # If sentence is long enough, send it
-                    if len(current_sentence.strip()) > 5: # Avoid "Hi." latency
-                            print(f"[STREAM] Sent to TTS: {current_sentence}")
-                            
-                            # Measure TTS Latency
-                            t_tts_start = time.time()
-                            first_byte = True
-
-                            # Stream TTS audio chunks directly
-                            voice_id, lang_code, model_id = self._get_voice_settings(current_sentence)
-                            tts_output = await ws.send(
-                                model_id=model_id,
-                                transcript=current_sentence,
-                                voice={"mode": "id", "id": voice_id},
-                                output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": self.output_sample_rate},
-                                language=lang_code,
-                                stream=True
-                            )
-                            async for audio_chunk in tts_output:
-                                if hasattr(audio_chunk, "audio") and audio_chunk.audio:
-                                    if first_byte:
-                                        print(f"[TIME] TTS Latency: {time.time() - t_tts_start:.3f}s")
-                                        first_byte = False
-                                    yield None, audio_chunk.audio
-                            
-                            yield {"agent": current_sentence}, None # Update UI incrementally
-                            current_sentence = ""
-
-            # Flush remaining buffer
-            if current_sentence.strip():
-                print(f"[STREAM] Sent Final: {current_sentence}")
-                voice_id, lang_code, model_id = self._get_voice_settings(current_sentence)
-                tts_output = await ws.send(
-                    model_id=model_id,
-                    transcript=current_sentence,
-                    voice={"mode": "id", "id": voice_id},
-                    output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": 24000},
-                    language=lang_code,
-                    stream=True
-                )
-                async for audio_chunk in tts_output:
-                    if hasattr(audio_chunk, "audio") and audio_chunk.audio:
-                        yield None, audio_chunk.audio
-                yield {"agent": current_sentence}, None
-
-        finally:
-            # Close TTS
-            if ws:
-                await ws.close()
             
+        finally:
             # TRIGGER HANGUP IF REQUESTED
             if should_end_call:
                  print("[AGENT] Sending End Call Signal to Server...")
@@ -842,29 +834,26 @@ Return ONLY JSON."""
             # 1. Yield Text Event (for logging)
             yield {"agent": text}, None
 
-            ws = await self.cartesia.tts.websocket()
-            output = await ws.send(
-                model_id=model_id,
-                transcript=text,
-                voice={"mode": "id", "id": voice_id},
-                output_format={
-                    "container": "raw", 
-                    "encoding": "pcm_s16le", 
-                    "sample_rate": self.output_sample_rate
-                },
-                language=lang_code,
-                stream=True
-            )
+            async with self.cartesia.tts.websocket_connect() as ws:
+                ctx = ws.context()
+                await ctx.send(
+                    model_id=model_id,
+                    transcript=text,
+                    voice={"mode": "id", "id": voice_id},
+                    output_format={
+                        "container": "raw", 
+                        "encoding": "pcm_s16le", 
+                        "sample_rate": self.output_sample_rate
+                    },
+                    language=lang_code
+                )
 
-            async for chunk in output:
-                if hasattr(chunk, "audio") and chunk.audio:
-                    yield None, chunk.audio
+                async for event in ctx.receive():
+                    if getattr(event, "type", None) == "chunk" and hasattr(event, "audio") and event.audio:
+                        yield None, event.audio
 
         except Exception as e:
             print(f"Cartesia Say Error: {e}")
-        finally:
-            if ws:
-                await ws.close()
 
         # Legacy Action Engine Removed
     
